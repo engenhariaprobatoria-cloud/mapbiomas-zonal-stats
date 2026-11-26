@@ -1,0 +1,98 @@
+// MapBiomas zonal statistics - area por classe + area nao atribuida
+// Max Lino Machado - CRBio 076313/04-D | v1.5 | MIT
+var CFG = {
+  asset: 'projects/mapbiomas-public/assets/brazil/lulc/collection9/mapbiomas_collection90_integration_v1',
+  years: [1985, 1990, 1995, 2000, 2005, 2010, 2015, 2020, 2023],
+  scale: 30,
+  mmu: 0.5,
+  epsg: 'EPSG:31983',
+  ver: '1.5'
+};
+
+var MB = ee.Image(CFG.asset);
+
+// 17 classes: as 10 originais + cafe (46), soja (39), cana (20),
+// outras lavouras temporarias (41), perenes (48), campo alagado (11) e
+// afloramento rochoso (29) - candidatas a explicar a area nao atribuida.
+var IDS = [3, 4, 9, 11, 12, 15, 20, 21, 24, 25, 29, 30, 33, 39, 41, 46, 48];
+
+var CORES = [
+  '1f8d49', '7dc975', '7a5900', '519799', 'd6bc74', 'edde8e',
+  'db7093', 'ffefc3', 'd4271e', 'db4d4f', 'ff8c00', '9c0027',
+  '2532e4', 'f5b3c8', 'c71585', '8b4513', 'b8860b'
+];
+
+var AOI = ee.FeatureCollection('FAO/GAUL/2015/level2')
+  .filter(ee.Filter.eq('ADM1_NAME', 'Minas Gerais'))
+  .filter(ee.Filter.and(
+    ee.Filter.stringContains('ADM2_NAME', 'Amparo'),
+    ee.Filter.stringContains('ADM2_NAME', 'Ant')));
+
+print('AOI:', AOI.size(), AOI.aggregate_array('ADM2_NAME'));
+
+var toDict = function (grupos) {
+  var g = ee.List(grupos);
+  var k = g.map(function (i) {
+    return ee.Number(ee.Dictionary(i).get('class_id')).format('%d');
+  });
+  var v = g.map(function (i) {
+    return ee.Number(ee.Dictionary(i).get('sum'));
+  });
+  return ee.Dictionary.fromLists(k, v);
+};
+
+var linhaAno = function (ano) {
+  var grupos = ee.Image.pixelArea()
+    .addBands(MB.select('classification_' + ano))
+    .reduceRegion({
+      reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'class_id'}),
+      geometry: AOI.geometry(),
+      scale: CFG.scale,
+      maxPixels: 1e13,
+      bestEffort: false,
+      tileScale: 4
+    }).get('groups');
+
+  var d = toDict(grupos);
+  var totalHa = ee.Number(d.values().reduce(ee.Reducer.sum())).divide(10000);
+
+  var row = ee.Dictionary({ano: ano, total_ha: totalHa});
+
+  IDS.forEach(function (id) {
+    var ha = ee.Number(d.get(ee.Number(id).format('%d'), 0)).divide(10000);
+    row = row.set('c' + id + '_ha', ha);
+    // CORRIGIDO: so marca quando existe area (ha > 0) E ela e menor que o MMU.
+    row = row.set('c' + id + '_abaixo_mmu', ha.gt(0).and(ha.lt(CFG.mmu)));
+  });
+
+  var somaExtraidas = ee.Number(ee.List(IDS.map(function (id) {
+    return ee.Number(d.get(ee.Number(id).format('%d'), 0));
+  })).reduce(ee.Reducer.sum())).divide(10000);
+
+  row = row.set('extraido_ha', somaExtraidas);
+  row = row.set('nao_atribuido_ha', totalHa.subtract(somaExtraidas));
+
+  return ee.Feature(null, row);
+};
+
+var tabela = ee.FeatureCollection(CFG.years.map(linhaAno))
+  .map(function (f) {
+    return f.set('asset', CFG.asset).set('escala_m', CFG.scale)
+      .set('mmu_ha', CFG.mmu).set('crs', CFG.epsg).set('versao', CFG.ver);
+  });
+
+print('Tabela:', tabela.limit(3));
+
+var ultimo = CFG.years[CFG.years.length - 1];
+var seq = ee.List.sequence(1, IDS.length);
+var img = MB.select('classification_' + ultimo).remap(IDS, seq);
+Map.addLayer(img.clip(AOI), {min: 1, max: IDS.length, palette: CORES}, 'Uso ' + ultimo);
+Map.addLayer(AOI, {color: 'red'}, 'AOI', false);
+Map.centerObject(AOI, 11);
+
+Export.table.toDrive({
+  collection: tabela,
+  description: 'mapbiomas_zonal_stats_v15',
+  folder: 'gee_mapbiomas',
+  fileNamePrefix: 'mapbiomas_zonal_stats_v15',
+  fileFormat: 'CSV'
